@@ -1,0 +1,21 @@
+[project]
+name = "lmsl-smart-offload"
+version = "0.1.0"
+description = "Future-aware smart resident scheduler for ComfyUI low VRAM (--lowvram / --enable-dynamic-vram). Reduces model swap thrashing on 12GB GPUs such as RTX 3060."
+requires-python = ">=3.9"
+classifiers = [
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Repository = "https://github.com/mxh678988/lmsl-smart-offload"
+Documentation = "https://github.com/mxh678988/lmsl-smart-offload/blob/main/README.md"
+
+[project.entry-points.comfyui]
+nodes = "lmsl_smart_offload"
+
+[tool.comfy]
+PublisherId = "mxh678988"
+DisplayName = "Smart Resident Scheduler (LMSL)"
