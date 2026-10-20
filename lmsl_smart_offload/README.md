@@ -77,5 +77,30 @@ ComfyUI 低显存模式下，模型在 GPU / CPU 之间按需换入换出。默�
 
 - `__init__.py` —— 入口：安装补丁 + 注册 prompt 钩子 + 注册节点类
 - `smart_offload.py` —— 核心实现（图预扫描 / 驻留策略 / 可选预加载）
+- `sdk_bridge.py` —— TDS SDK 选型桥接（启动预热 / 体检 / 建议 / 意图推荐，fail-soft）
+- `routes.py` —— 只读 HTTP 状态路由（见下）
+- `version.py` —— 版本号单点
 - `README.md` —— 本说明
+
+## TDS SDK 选型桥接（v0.2.0 新增）
+
+插件启动时后台探测 TDS SDK（`custom_nodes/TDS`，自动匹配 + 上下文预算 + 太极预测器），
+在**不修改工作流、不阻塞启动**的前提下，把 SDK 的模型匹配结果暴露给三个入口：
+
+1. **体检日志**：每张 prompt 排队时对图内模型做一次选型体检，单行日志输出
+   `[sdk] 选型体检 N 个模型 verdict=...`（ok / offload / untracked / tight / oom）；
+2. **推荐节点**：`Smart Model Recommender (LMSL / TDS SDK)` —— 输入
+   `domain / tags / limit / include_offload`，按创作意图给出首选模型；
+   `Smart Model Advisor (LMSL / TDS SDK)` —— 对单模型判定并给同域替补；
+3. **只读 HTTP 路由**（需要 ComfyUI 服务运行）：
+
+| 端点 | 说明 |
+| --- | --- |
+| `GET /lmsl_sdk/status` | 桥接状态：SDK 可用性、硬件/软件、上下文预算、目录评估数、体检计数 |
+| `GET /lmsl_sdk/recommend?domain=diffusion&tags=wan2.1,t2v&limit=3&include_offload=true` | 按意图推荐模型（`tags` 支持逗号分隔或重复传参，多个标签为"且"关系） |
+| `GET /lmsl_sdk/advise?model=<模型文件名>&limit=3` | 单模型判定 + 同域替补 |
+
+- 开关：环境变量 `LMSL_SDK_BRIDGE=0`（或 off/false）可整体停用桥接，插件退回纯调度；
+- 桥接所有路径均 fail-soft：SDK 缺失 / 未就绪 / 异常时只记日志，不影响出图与调度。
+
 *（内容由AI生成，仅供参考）*

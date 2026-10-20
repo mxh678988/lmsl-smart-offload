@@ -10,6 +10,10 @@ Reduces model swap thrashing on 12GB GPUs (e.g. RTX 3060) when running with
 - Reserves resident models in VRAM to avoid reload thrashing
 - Future-aware scheduling based on queue preview
 - Lightweight: no extra dependencies beyond ComfyUI itself
+- TDS SDK selection bridge (v0.2.0): model health audit, intent-based
+  recommendation nodes, and read-only HTTP endpoints under `/lmsl_sdk/*`
+  (`status` / `recommend` / `advise`). All bridge paths fail soft and never
+  block startup or workflow execution.
 
 ## Installation
 

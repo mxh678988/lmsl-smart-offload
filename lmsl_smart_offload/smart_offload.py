@@ -49,6 +49,7 @@ Design constraints
 from __future__ import annotations
 
 import heapq
+import json
 import logging
 import threading
 from typing import Any, Dict, List, Optional
@@ -57,6 +58,8 @@ import nodes  # ComfyUI node registry (available at prompt-execution time)
 
 # Imported lazily below because this module may be imported very early.
 import comfy.model_management as mm
+
+from . import sdk_bridge
 
 logger = logging.getLogger("lmsl-smart-offload")
 
@@ -273,6 +276,35 @@ def _apply_node_config(prompt: Dict[str, Any]) -> None:
         logger.warning("[smart-offload] failed to read config node", exc_info=True)
 
 
+_LAST_SDK_AUDIT: Optional[Dict[str, Any]] = None
+
+
+def _sdk_audit(json_data: dict) -> Optional[Dict[str, Any]]:
+    """TDS SDK 选型体检：对人工选定的模型给出 ok/tight/oom 判定与替补建议。
+
+    纯只读，不修改执行图，不改动任何调度状态；SDK 未就绪时立即返回。
+    """
+    global _LAST_SDK_AUDIT
+    prompt = json_data.get("prompt")
+    if not isinstance(prompt, dict):
+        return _LAST_SDK_AUDIT
+    result = sdk_bridge.audit_prompt(prompt)
+    _LAST_SDK_AUDIT = result
+    models = result.get("models") or []
+    if models:
+        line = sdk_bridge.get_bridge().log_line(result)
+        if result.get("verdict") == "warn":
+            logger.warning(line)
+        else:
+            logger.info(line)
+    return result
+
+
+def last_sdk_audit() -> Optional[Dict[str, Any]]:
+    """最近一次选型体检结果（供节点/外部查询）。"""
+    return _LAST_SDK_AUDIT
+
+
 def on_prompt_handler(json_data: dict) -> dict:
     """Registered via PromptServer.instance.add_on_prompt_handler.
 
@@ -301,6 +333,12 @@ def on_prompt_handler(json_data: dict) -> dict:
                 )
     except Exception:
         logger.warning("[smart-offload] plan build failed (continuing with stock behavior)", exc_info=True)
+
+    # 选型体检与驻留调度完全解耦：独立 try，异常绝不影响出图或 plan
+    try:
+        _sdk_audit(json_data)
+    except Exception:
+        logger.debug("[smart-offload] sdk audit skipped", exc_info=True)
     return json_data
 
 
@@ -479,6 +517,148 @@ class SmartResidentScheduler:
         # The on_prompt_handler already read the widgets; this call keeps the
         # node a no-op in the execution graph.
         return ()
+
+
+class SmartModelAdvisor:
+    """只读节点：查询 TDS SDK 对单个模型文件的可行性判定与同域替补建议。
+
+    不参与调度，不改动任何状态，只把 SDK 的匹配结论暴露到工作流里，
+    让"人工选模型"可以被 SDK 的 matches 推荐校验。
+    """
+
+    CATEGORY = "LMSL/模型选型"
+    FUNCTION = "advise_report"
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("verdict", "advice", "report")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model_name": ("STRING", {"default": "", "multiline": False}),
+            },
+            "optional": {
+                "limit": ("INT", {"default": 3, "min": 1, "max": 10, "step": 1}),
+            },
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # 只读查询节点，不参与缓存，每次执行都重新出建议
+        return float("nan")
+
+    def advise_report(self, model_name: str, limit: int = 3) -> tuple:
+        try:
+            res = sdk_bridge.advise(model_name, limit=limit)
+        except Exception:
+            logger.warning("[smart-offload] sdk advise failed", exc_info=True)
+            res = {
+                "file": model_name, "status": "error", "verdict": "pass",
+                "reason": "SDK 查询异常，已放行", "substitutes": [],
+            }
+
+        status = str(res.get("status") or "unknown")
+        verdict = str(res.get("verdict") or "pass")
+        raw = str(res.get("file") or model_name or "")
+        name = raw.replace("\\", "/").rsplit("/", 1)[-1]
+
+        lines = ["模型: {}".format(name or "-"), "判定: {} ({})".format(status, verdict)]
+        if res.get("domain"):
+            lines.append("域: {}".format(res["domain"]))
+        try:
+            if res.get("footprint_mb"):
+                lines.append("显存占用: {:.0f} MB".format(float(res["footprint_mb"])))
+            if res.get("headroom_mb"):
+                lines.append("余量: {:.0f} MB".format(float(res["headroom_mb"])))
+        except Exception:
+            pass
+        if res.get("reason"):
+            lines.append("原因: {}".format(res["reason"]))
+        subs = res.get("substitutes") or []
+        if subs:
+            lines.append("建议替补:")
+            for i, s in enumerate(subs, 1):
+                lines.append("  {}. {} [{}] score={}".format(
+                    i, s.get("name"), s.get("domain"), s.get("score")))
+        else:
+            lines.append("建议替补: 无")
+        try:
+            report = json.dumps(res, ensure_ascii=False, indent=2)
+        except Exception:
+            report = str(res)
+        return (verdict, "\n".join(lines), report)
+
+
+class SmartModelRecommender:
+    """按创作意图反查"该用哪个模型"，直接替代人工盲选。
+
+    与 SmartModelAdvisor 的区别：Advisor 是"你选了 A，A 行不行"，
+    Recommender 是"我要做 Wan2.1 文生视频，SDK 推荐哪个"。只读查询，
+    不改动调度状态。
+    """
+
+    CATEGORY = "LMSL/模型选型"
+    FUNCTION = "recommend_models"
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("primary", "report")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "domain": ("STRING", {"default": "diffusion", "multiline": False}),
+                "tags": ("STRING", {"default": "wan2.1,t2v", "multiline": False}),
+            },
+            "optional": {
+                "limit": ("INT", {"default": 3, "min": 1, "max": 10, "step": 1}),
+                "include_offload": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    def recommend_models(
+        self,
+        domain: str = "diffusion",
+        tags: str = "",
+        limit: int = 3,
+        include_offload: bool = True,
+    ) -> tuple:
+        tag_list = tuple(
+            t.strip() for t in str(tags).replace("，", ",").split(",") if t.strip()
+        )
+        try:
+            res = sdk_bridge.recommend(
+                domain=str(domain or "").strip(),
+                tags=tag_list,
+                limit=limit,
+                include_offload=bool(include_offload),
+            )
+        except Exception:
+            logger.warning("[smart-offload] sdk recommend failed", exc_info=True)
+            res = {"picks": [], "reason": "SDK 查询异常", "state": "error"}
+
+        picks = res.get("picks") or []
+        lines = [
+            "意图: domain={} tags={}".format(domain or "*", ",".join(tag_list) or "*"),
+            "结果: {}".format(res.get("reason") or "-"),
+        ]
+        for i, p in enumerate(picks, 1):
+            lines.append("  {}. {} [{}] {:.0f}MB 余量{:.0f}MB".format(
+                i, p.get("file"), p.get("status"),
+                float(p.get("footprint_mb") or 0.0),
+                float(p.get("headroom_mb") or 0.0),
+            ))
+        if not picks:
+            lines.append("  （无候选）")
+        try:
+            report = json.dumps(res, ensure_ascii=False, indent=2)
+        except Exception:
+            report = str(res)
+        primary = str(picks[0].get("file") or "") if picks else ""
+        return (primary, "\n".join(lines) + "\n\n" + report)
 
 
 # --------------------------------------------------------------------------

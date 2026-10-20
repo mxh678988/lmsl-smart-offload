@@ -1,6 +1,6 @@
 [project]
 name = "lmsl-smart-offload"
-version = "0.1.0"
+version = "0.2.0"
 description = "Future-aware smart resident scheduler for ComfyUI low VRAM (--lowvram / --enable-dynamic-vram). Reduces model swap thrashing on 12GB GPUs such as RTX 3060."
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
